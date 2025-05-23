@@ -31,3 +31,6 @@ FAKE_STREAMING_INTERVAL_SECONDS = float(os.environ.get("FAKE_STREAMING_INTERVAL"
 MODELS_CONFIG_URL = os.environ.get("MODELS_CONFIG_URL", "https://raw.githubusercontent.com/gzzhongqi/vertex2openai/refs/heads/main/vertexModels.json")
 
 # Validation logic moved to app/auth.py
+
+# 允许使用的模型名称
+ALLOWED_MODEL_NAMES = [name.strip() for name in os.environ.get("ALLOWED_MODEL", "gemini-2.5-pro-exp-03-25").split(',') if name.strip()]
