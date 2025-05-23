@@ -39,6 +39,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
     try:
         # 检查模型名称是否在允许的模型名称列表中
         if request.model not in app_config.ALLOWED_MODEL_NAMES:
+            print(f"ERROR: Model '{request.model}' is not in the allowed model list.")
             return JSONResponse(
                 status_code=400,
                 content={
