@@ -17,9 +17,10 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
     PAY_PREFIX = "[PAY]"
     # Access credential_manager from app state
     credential_manager_instance: CredentialManager = fastapi_request.app.state.credential_manager
+    express_key_manager_instance = fastapi_request.app.state.express_key_manager
 
     has_sa_creds = credential_manager_instance.get_total_credentials() > 0
-    has_express_key = bool(app_config.VERTEX_EXPRESS_API_KEY_VAL)
+    has_express_key = express_key_manager_instance.get_total_keys() > 0
 
     raw_vertex_models = await get_vertex_models()
     raw_express_models = await get_vertex_express_models()
@@ -90,7 +91,7 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
                     })
         
         # Apply special suffixes for models starting with "gemini-2.5-flash"
-        if original_model_id.startswith("gemini-2.5-flash"): # Suffix rules based on original_model_id
+        if "gemini-2.5-flash" in original_model_id: # Suffix rules based on original_model_id
             special_flash_suffixes = ["-nothinking", "-max"]
             for special_suffix in special_flash_suffixes:
                 suffixed_model_part = f"{original_model_id}{special_suffix}"

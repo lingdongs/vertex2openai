@@ -2,26 +2,219 @@ import json
 import time
 import math
 import asyncio
-import base64 
+import base64
 from typing import List, Dict, Any, Callable, Union, Optional
 
 from fastapi.responses import JSONResponse, StreamingResponse
 from google.auth.transport.requests import Request as AuthRequest
 from google.genai import types
-from google.genai.types import HttpOptions 
+from google.genai.types import HttpOptions
 from google import genai # Original import
 from openai import AsyncOpenAI
 
 from models import OpenAIRequest, OpenAIMessage
 from message_processing import (
-    deobfuscate_text, 
-    convert_to_openai_format, 
-    convert_chunk_to_openai, 
+    deobfuscate_text,
+    convert_to_openai_format,
+    convert_chunk_to_openai,
     create_final_chunk,
-    split_text_by_completion_tokens,
-    parse_gemini_response_for_reasoning_and_content # Added import
+    parse_gemini_response_for_reasoning_and_content, # Added import
+    extract_reasoning_by_tags # Added for new OpenAI direct reasoning logic
 )
 import config as app_config
+from config import VERTEX_REASONING_TAG
+
+class StreamingReasoningProcessor:
+    """Stateful processor for extracting reasoning from streaming content with tags."""
+    
+    def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
+        self.tag_name = tag_name
+        self.open_tag = f"<{tag_name}>"
+        self.close_tag = f"</{tag_name}>"
+        self.tag_buffer = ""
+        self.inside_tag = False
+        self.reasoning_buffer = ""
+        self.partial_tag_buffer = ""  # Buffer for potential partial tags
+    
+    def process_chunk(self, content: str) -> tuple[str, str]:
+        """
+        Process a chunk of streaming content.
+        
+        Args:
+            content: New content from the stream
+            
+        Returns:
+            A tuple of:
+            - processed_content: Content with reasoning tags removed
+            - current_reasoning: Reasoning text found in this chunk (partial or complete)
+        """
+        # Add new content to buffer, but also handle any partial tag from before
+        if self.partial_tag_buffer:
+            # We had a partial tag from the previous chunk
+            content = self.partial_tag_buffer + content
+            self.partial_tag_buffer = ""
+        
+        self.tag_buffer += content
+        
+        processed_content = ""
+        current_reasoning = ""
+        
+        while self.tag_buffer:
+            if not self.inside_tag:
+                # Look for opening tag
+                open_pos = self.tag_buffer.find(self.open_tag)
+                if open_pos == -1:
+                    # No complete opening tag found
+                    # Check if we might have a partial tag at the end
+                    partial_match = False
+                    for i in range(1, min(len(self.open_tag), len(self.tag_buffer) + 1)):
+                        if self.tag_buffer[-i:] == self.open_tag[:i]:
+                            partial_match = True
+                            # Output everything except the potential partial tag
+                            if len(self.tag_buffer) > i:
+                                processed_content += self.tag_buffer[:-i]
+                                self.partial_tag_buffer = self.tag_buffer[-i:]
+                                self.tag_buffer = ""
+                            else:
+                                # Entire buffer is partial tag
+                                self.partial_tag_buffer = self.tag_buffer
+                                self.tag_buffer = ""
+                            break
+                    
+                    if not partial_match:
+                        # No partial tag, output everything
+                        processed_content += self.tag_buffer
+                        self.tag_buffer = ""
+                    break
+                else:
+                    # Found opening tag
+                    processed_content += self.tag_buffer[:open_pos]
+                    self.tag_buffer = self.tag_buffer[open_pos + len(self.open_tag):]
+                    self.inside_tag = True
+            else:
+                # Inside tag, look for closing tag
+                close_pos = self.tag_buffer.find(self.close_tag)
+                if close_pos == -1:
+                    # No complete closing tag yet
+                    # Check for partial closing tag
+                    partial_match = False
+                    for i in range(1, min(len(self.close_tag), len(self.tag_buffer) + 1)):
+                        if self.tag_buffer[-i:] == self.close_tag[:i]:
+                            partial_match = True
+                            # Add everything except potential partial tag to reasoning
+                            if len(self.tag_buffer) > i:
+                                new_reasoning = self.tag_buffer[:-i]
+                                self.reasoning_buffer += new_reasoning
+                                if new_reasoning:  # Stream reasoning as it arrives
+                                    current_reasoning = new_reasoning
+                                self.partial_tag_buffer = self.tag_buffer[-i:]
+                                self.tag_buffer = ""
+                            else:
+                                # Entire buffer is partial tag
+                                self.partial_tag_buffer = self.tag_buffer
+                                self.tag_buffer = ""
+                            break
+                    
+                    if not partial_match:
+                        # No partial tag, add all to reasoning and stream it
+                        if self.tag_buffer:
+                            self.reasoning_buffer += self.tag_buffer
+                            current_reasoning = self.tag_buffer
+                            self.tag_buffer = ""
+                    break
+                else:
+                    # Found closing tag
+                    final_reasoning_chunk = self.tag_buffer[:close_pos]
+                    self.reasoning_buffer += final_reasoning_chunk
+                    if final_reasoning_chunk:  # Include the last chunk of reasoning
+                        current_reasoning = final_reasoning_chunk
+                    self.reasoning_buffer = ""  # Clear buffer after complete tag
+                    self.tag_buffer = self.tag_buffer[close_pos + len(self.close_tag):]
+                    self.inside_tag = False
+        
+        return processed_content, current_reasoning
+    
+    def flush_remaining(self) -> tuple[str, str]:
+        """
+        Flush any remaining content in the buffer when the stream ends.
+        
+        Returns:
+            A tuple of:
+            - remaining_content: Any content that was buffered but not yet output
+            - remaining_reasoning: Any incomplete reasoning if we were inside a tag
+        """
+        remaining_content = ""
+        remaining_reasoning = ""
+        
+        # First handle any partial tag buffer
+        if self.partial_tag_buffer:
+            # The partial tag wasn't completed, so treat it as regular content
+            remaining_content += self.partial_tag_buffer
+            self.partial_tag_buffer = ""
+        
+        if not self.inside_tag:
+            # If we're not inside a tag, output any remaining buffer
+            if self.tag_buffer:
+                remaining_content += self.tag_buffer
+                self.tag_buffer = ""
+        else:
+            # If we're inside a tag when stream ends, we have incomplete reasoning
+            # First, yield any reasoning we've accumulated
+            if self.reasoning_buffer:
+                remaining_reasoning = self.reasoning_buffer
+                self.reasoning_buffer = ""
+            
+            # Then output the remaining buffer as content (it's an incomplete tag)
+            if self.tag_buffer:
+                # Don't include the opening tag in output - just the buffer content
+                remaining_content += self.tag_buffer
+                self.tag_buffer = ""
+            
+            self.inside_tag = False
+        
+        return remaining_content, remaining_reasoning
+
+
+def process_streaming_content_with_reasoning_tags(
+    content: str,
+    tag_buffer: str,
+    inside_tag: bool,
+    reasoning_buffer: str,
+    tag_name: str = VERTEX_REASONING_TAG
+) -> tuple[str, str, bool, str, str]:
+    """
+    Process streaming content to extract reasoning within tags.
+    
+    This is a compatibility wrapper for the stateful function. Consider using
+    StreamingReasoningProcessor class directly for cleaner code.
+    
+    Args:
+        content: New content from the stream
+        tag_buffer: Existing buffer for handling tags split across chunks
+        inside_tag: Whether we're currently inside a reasoning tag
+        reasoning_buffer: Buffer for accumulating reasoning content
+        tag_name: The tag name to look for (defaults to VERTEX_REASONING_TAG)
+    
+    Returns:
+        A tuple of:
+        - processed_content: Content with reasoning tags removed
+        - current_reasoning: Complete reasoning text if a closing tag was found
+        - inside_tag: Updated state of whether we're inside a tag
+        - reasoning_buffer: Updated reasoning buffer
+        - tag_buffer: Updated tag buffer
+    """
+    # Create a temporary processor with the current state
+    processor = StreamingReasoningProcessor(tag_name)
+    processor.tag_buffer = tag_buffer
+    processor.inside_tag = inside_tag
+    processor.reasoning_buffer = reasoning_buffer
+    
+    # Process the chunk
+    processed_content, current_reasoning = processor.process_chunk(content)
+    
+    # Return the updated state
+    return (processed_content, current_reasoning, processor.inside_tag,
+            processor.reasoning_buffer, processor.tag_buffer)
 
 def create_openai_error_response(status_code: int, message: str, error_type: str) -> Dict[str, Any]:
     return {
@@ -155,7 +348,8 @@ async def gemini_fake_stream_generator( # Changed to async
     request_obj: OpenAIRequest,
     is_auto_attempt: bool
 ):
-    print(f"FAKE STREAMING (Gemini): Prep for '{request_obj.model}' with reasoning separation.")
+    model_name_for_log = getattr(gemini_client_instance, 'model_name', 'unknown_gemini_model_object')
+    print(f"FAKE STREAMING (Gemini): Prep for '{request_obj.model}' (API model string: '{model_for_api_call}', client obj: '{model_name_for_log}') with reasoning separation.")
     response_id = f"chatcmpl-{int(time.time())}"
 
     # 1. Create and await the API call task
@@ -234,24 +428,24 @@ async def gemini_fake_stream_generator( # Changed to async
         # Consider re-raising if auto-mode needs to catch this: raise e_outer_gemini
 
 
-async def openai_fake_stream_generator(
+async def openai_fake_stream_generator( # Reverted signature: removed thought_tag_marker
     openai_client: AsyncOpenAI,
-    openai_params: Dict[str, Any], 
+    openai_params: Dict[str, Any],
     openai_extra_body: Dict[str, Any],
     request_obj: OpenAIRequest,
-    is_auto_attempt: bool,
-    gcp_credentials: Any, 
-    gcp_project_id: str, 
-    gcp_location: str,
-    base_model_id_for_tokenizer: str 
+    is_auto_attempt: bool
+    # Removed thought_tag_marker as parsing uses a fixed tag now
+    # Removed gcp_credentials, gcp_project_id, gcp_location, base_model_id_for_tokenizer previously
 ):
-    print(f"FAKE STREAMING (OpenAI): Prep for '{request_obj.model}' with reasoning split.")
+    api_model_name = openai_params.get("model", "unknown-openai-model")
+    print(f"FAKE STREAMING (OpenAI): Prep for '{request_obj.model}' (API model: '{api_model_name}') with reasoning split.")
     response_id = f"chatcmpl-{int(time.time())}"
     
     async def _openai_api_call_and_split_task_creator_wrapper():
         params_for_non_stream_call = openai_params.copy()
         params_for_non_stream_call['stream'] = False
         
+        # Use the already configured extra_body which includes the thought_tag_marker
         _api_call_task = asyncio.create_task(
             openai_client.chat.completions.create(**params_for_non_stream_call, extra_body=openai_extra_body)
         )
@@ -262,18 +456,26 @@ async def openai_fake_stream_generator(
         vertex_completion_tokens = 0
         if raw_response.usage and raw_response.usage.completion_tokens is not None:
             vertex_completion_tokens = raw_response.usage.completion_tokens
+        # --- Start Inserted Block (Tag-based reasoning extraction) ---
         reasoning_text = ""
-        actual_content_text = full_content_from_api
-        if full_content_from_api and vertex_completion_tokens > 0:
-            reasoning_text, actual_content_text, _ = await asyncio.to_thread(
-                split_text_by_completion_tokens, 
-                gcp_credentials, gcp_project_id, gcp_location,
-                base_model_id_for_tokenizer, 
-                full_content_from_api,
-                vertex_completion_tokens
-            )
-            if reasoning_text:
-                 print(f"DEBUG_FAKE_REASONING_SPLIT: Success. Reasoning len: {len(reasoning_text)}, Content len: {len(actual_content_text)}")
+        # Ensure actual_content_text is a string even if API returns None
+        actual_content_text = full_content_from_api if isinstance(full_content_from_api, str) else ""
+
+        if actual_content_text: # Check if content exists
+            print(f"INFO: OpenAI Direct Fake-Streaming - Applying tag extraction with fixed marker: '{VERTEX_REASONING_TAG}'")
+            # Unconditionally attempt extraction with the fixed tag
+            reasoning_text, actual_content_text = extract_reasoning_by_tags(actual_content_text, VERTEX_REASONING_TAG)
+            # if reasoning_text:
+            #      print(f"DEBUG: Tag extraction success (fixed tag). Reasoning len: {len(reasoning_text)}, Content len: {len(actual_content_text)}")
+            # else:
+            #      print(f"DEBUG: No content found within fixed tag '{VERTEX_REASONING_TAG}'.")
+        else:
+             print(f"WARNING: OpenAI Direct Fake-Streaming - No initial content found in message.")
+             actual_content_text = "" # Ensure empty string
+
+        # --- End Revised Block ---
+
+        # The return uses the potentially modified variables:
         return raw_response, reasoning_text, actual_content_text
 
     temp_task_for_keepalive_check = asyncio.create_task(_openai_api_call_and_split_task_creator_wrapper())
