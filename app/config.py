@@ -37,3 +37,6 @@ VERTEX_REASONING_TAG = "vertex_think_tag"
 ROUNDROBIN = os.environ.get("ROUNDROBIN", "false").lower() == "true"
 
 # Validation logic moved to app/auth.py
+
+# 允许使用的模型名称
+ALLOWED_MODEL_NAMES = [name.strip() for name in os.environ.get("ALLOWED_MODEL", "gemini-2.5-pro-exp-03-25").split(',') if name.strip()]
