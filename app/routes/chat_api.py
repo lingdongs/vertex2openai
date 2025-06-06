@@ -30,6 +30,19 @@ router = APIRouter()
 @router.post("/v1/chat/completions")
 async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api_key: str = Depends(get_api_key)):
     try:
+        # 检查模型名称是否在允许的模型名称列表中
+        if not ("all" in app_config.ALLOWED_MODEL_NAMES or request.model in app_config.ALLOWED_MODEL_NAMES):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "目前仅支持 " + ", ".join(app_config.ALLOWED_MODEL_NAMES) + " 模型",
+                        "type": "invalid_request_error",
+                        "code": "invalid_model"
+                    }
+                }
+            )
+        
         credential_manager_instance = fastapi_request.app.state.credential_manager
         OPENAI_DIRECT_SUFFIX = "-openai"
         EXPERIMENTAL_MARKER = "-exp-"
