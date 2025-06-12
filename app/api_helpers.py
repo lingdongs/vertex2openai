@@ -244,6 +244,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
             types.SafetySetting(category="HARM_CATEGORY_CIVIC_INTEGRITY", threshold="OFF")
     ]
+    config["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
     return config
 
 def is_gemini_response_valid(response: Any) -> bool:
@@ -253,7 +254,7 @@ def is_gemini_response_valid(response: Any) -> bool:
     if hasattr(response, 'text') and isinstance(response.text, str) and response.text.strip():
         return True
     
-    # Check for candidates (both SDK and DirectVertexClient responses)
+    # Check for candidates in the response
     if hasattr(response, 'candidates') and response.candidates:
         for candidate in response.candidates:
             # Check for direct text on candidate
